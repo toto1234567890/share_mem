@@ -2,7 +2,7 @@ use std::ptr;
 use std::slice;
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 // windows specific
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, HANDLE};
@@ -10,7 +10,7 @@ use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, MEMORY_MAPPED_VIEW_ADDRESS, FILE_MAP_ALL_ACCESS, PAGE_READWRITE,
 };
 
-const SHM_NAME: &str = "Local\\ultra_low_latency_shm";
+const SHM_NAME: &str = "Local\\low_latency_shm";
 const BUFFER_SIZE: usize = 1024 * 1024; // 1 MB shared memory
 const SLOT_SIZE: usize = 128;          // Fixed-size message slot
 const NUM_PRODUCERS: usize = 1;        // Number of producer processes
@@ -69,43 +69,55 @@ impl SharedRingBuffer {
         })
     }
 
-    /// Write a message to the ring buffer
+    #[inline(always)]
+    fn is_full(&self) -> bool {
+        let read_idx = self.read_idx.load(Ordering::Relaxed);
+        let write_idx = self.write_idx.load(Ordering::Relaxed);
+        (write_idx.wrapping_sub(read_idx) / SLOT_SIZE) >= (BUFFER_SIZE / SLOT_SIZE)
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.read_idx.load(Ordering::Relaxed) == self.write_idx.load(Ordering::Acquire)
+    }
+
     fn write_message(&self, message: &[u8]) -> Result<(), String> {
-        if message.len() > SLOT_SIZE {
-            return Err("Message too large for slot".to_string());
+        while self.is_full() {
+            spin_wait(Duration::from_micros(5));
         }
 
-        let write_idx = self.write_idx.load(Ordering::Acquire);
+        let write_idx = self.write_idx.load(Ordering::Relaxed);
         let start = write_idx % BUFFER_SIZE;
-        let end = start + SLOT_SIZE;
 
-        if end > BUFFER_SIZE {
-            return Err("Buffer overflow".to_string());
-        }
-
-        // Safe because we ensure the buffer is valid and properly synchronized
         unsafe {
             let buffer = slice::from_raw_parts_mut(self.buffer.as_ptr(), BUFFER_SIZE);
-            buffer[start..start + message.len()].copy_from_slice(message);
+            buffer[start..start + 4].copy_from_slice(&(message.len() as u32).to_le_bytes());
+            buffer[start + 4..start + 4 + message.len()].copy_from_slice(message);
         }
 
         self.write_idx.store(write_idx + SLOT_SIZE, Ordering::Release);
         Ok(())
     }
 
-    /// Read a message from the ring buffer
     fn read_message(&self) -> Result<Vec<u8>, String> {
-        let read_idx = self.read_idx.load(Ordering::Acquire);
-        let start = read_idx % BUFFER_SIZE;
-        let end = start + SLOT_SIZE;
-
-        if end > BUFFER_SIZE {
-            return Err("Buffer underflow".to_string());
+        while self.is_empty() {
+            spin_wait(Duration::from_micros(1));
         }
+
+        let read_idx = self.read_idx.load(Ordering::Relaxed);
+        let start = read_idx % BUFFER_SIZE;
 
         let message = unsafe {
             let buffer = slice::from_raw_parts(self.buffer.as_ptr(), BUFFER_SIZE);
-            buffer[start..end].to_vec()
+            let mut len_bytes = [0u8; 4];
+            len_bytes.copy_from_slice(&buffer[start..start + 4]);
+            let message_len = u32::from_le_bytes(len_bytes) as usize;
+
+            if message_len > SLOT_SIZE - 4 {
+                return Err("Corrupted message length".to_string());
+            }
+
+            buffer[start + 4..start + 4 + message_len].to_vec()
         };
 
         self.read_idx.store(read_idx + SLOT_SIZE, Ordering::Release);
@@ -122,30 +134,30 @@ impl Drop for SharedRingBuffer {
     }
 }
 
-/// Producer thread
-fn producer(id: usize, ring_buffer: Arc<SharedRingBuffer>) {
+fn producer(_id: usize, ring_buffer: Arc<SharedRingBuffer>) {
     let mut message_count = 0;
     loop {
-        let message = format!("Producer {}: Message {}", id, message_count).into_bytes();
-        if ring_buffer.write_message(&message).is_err() {
-            eprintln!("Producer {}: Failed to write message", id);
-            break;
+        let message = format!("Received {}", message_count).into_bytes();
+        if ring_buffer.write_message(&message).is_ok() {
+            message_count += 1;
         }
-        message_count += 1;
-        //thread::sleep(Duration::from_millis(10)); // Simulate work
     }
 }
 
-/// Consumer thread
-fn consumer(id: usize, ring_buffer: Arc<SharedRingBuffer>) {
+fn consumer(_id: usize, ring_buffer: Arc<SharedRingBuffer>) {
     loop {
         if let Ok(message) = ring_buffer.read_message() {
-            println!("Consumer {}: Received: {:?}", id, String::from_utf8_lossy(&message));
-        } else {
-            eprintln!("Consumer {}: Failed to read message", id);
-            break;
+            println!("{}", String::from_utf8_lossy(&message));
         }
-        //thread::sleep(Duration::from_millis(10)); // Simulate work
+    }
+}
+
+// Low-latency CPU spin loop
+#[inline(always)]
+fn spin_wait(duration: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < duration {
+        std::hint::spin_loop();
     }
 }
 
