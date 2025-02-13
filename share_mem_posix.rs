@@ -3,16 +3,15 @@ use std::slice;
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use std::thread;
 use std::time::Duration;
-// posix
-use libc::{shm_open, shm_unlink, ftruncate, mmap, close};
+use libc::{shm_open, mmap, munmap, close, shm_unlink};
 use libc::{O_CREAT, O_RDWR, PROT_READ, PROT_WRITE, MAP_SHARED};
 use std::ffi::CString;
 
 const SHM_NAME: &str = "/ultra_low_latency_shm";
 const BUFFER_SIZE: usize = 1024 * 1024; // 1 MB shared memory
-const SLOT_SIZE: usize = 128;          // Fixed-size message slot
-const NUM_PRODUCERS: usize = 1;        // Number of producer processes
-const NUM_CONSUMERS: usize = 1;        // Number of consumer processes
+const SLOT_SIZE: usize = 128;           // Fixed-size message slot
+const NUM_PRODUCERS: usize = 1;         // Number of producer processes
+const NUM_CONSUMERS: usize = 1;         // Number of consumer processes
 
 /// Shared memory ring buffer
 struct SharedRingBuffer {
@@ -32,10 +31,6 @@ impl SharedRingBuffer {
         let fd = unsafe { shm_open(name.as_ptr(), O_CREAT | O_RDWR, 0o666) };
         if fd == -1 {
             return Err("Failed to create shared memory".to_string());
-        }
-
-        if unsafe { ftruncate(fd, BUFFER_SIZE as i64) } == -1 {
-            return Err("Failed to set shared memory size".to_string());
         }
 
         let addr = unsafe { mmap(ptr::null_mut(), BUFFER_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) };
@@ -67,7 +62,7 @@ impl SharedRingBuffer {
 
         // Safe because we ensure the buffer is valid and properly synchronized
         unsafe {
-            let buffer = slice::from_raw_parts_mut(self.buffer.as_ptr(), BUFFER_SIZE);
+            let buffer = slice::from_raw_parts_mut(self.buffer, BUFFER_SIZE);
             buffer[start..start + message.len()].copy_from_slice(message);
         }
 
@@ -86,7 +81,7 @@ impl SharedRingBuffer {
         }
 
         let message = unsafe {
-            let buffer = slice::from_raw_parts(self.buffer.as_ptr(), BUFFER_SIZE);
+            let buffer = slice::from_raw_parts(self.buffer, BUFFER_SIZE);
             buffer[start..end].to_vec()
         };        
         
@@ -97,9 +92,13 @@ impl SharedRingBuffer {
 
 impl Drop for SharedRingBuffer {
     fn drop(&mut self) {
-        unsafe {
-            shm_unlink(CString::new(SHM_NAME).unwrap().as_ptr());
-        }
+        unsafe { 
+            _ = munmap(self.buffer as *mut libc::c_void, BUFFER_SIZE)
+        } 
+        let name = CString::new(SHM_NAME).unwrap();
+        unsafe { 
+            _ = shm_unlink(name.as_ptr()) 
+        } 
     }
 }
 
