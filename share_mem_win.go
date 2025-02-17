@@ -77,7 +77,7 @@ func (rb *SharedAtomicRingBuffer) Write(value uint64) bool {
 	nextWriteIdx := (writeIdx + 1) % bufferSize
 
 	// Check if the buffer is full
-	if nextWriteIdx == rb.readIdx.Load() {
+	for nextWriteIdx == rb.readIdx.Load() {
 		SpinWait(5 * time.Microsecond)
 	}
 
