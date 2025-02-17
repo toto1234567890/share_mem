@@ -92,7 +92,7 @@ func (rb *SharedAtomicRingBuffer) Read() (uint64, bool) {
 	readIdx := rb.readIdx.Load()
 
 	// Check if the buffer is empty
-	if readIdx == rb.writeIdx.Load() {
+	for readIdx == rb.writeIdx.Load() {
 		SpinWait(1 * time.Microsecond)
 	}
 
